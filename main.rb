@@ -1,29 +1,41 @@
 require 'bugsnag/api'
 require 'csv'
 require 'pry'
+require './csv_map'
 
 client = Bugsnag::Api::Client.new(auth_token: ENV['BUGSNAG_PERSONAL_AUTH_TOKEN'])
 
+## select organization
 organizations = client.organizations
-organization_id = organizations.first.id
-projects = client.projects(organization_id)
+organization_slugs = organizations.map(&:slug)
+puts 'Select organization'
+selected_organization_slug = `echo #{organization_slugs.join ' '} | tr " " "\n" | fzf`.chomp
+if selected_organization_slug.empty?
+  puts 'No organization selected.'
+  exit 1
+end
+selected_organization = organizations.find do |organization|
+  organization.slug == selected_organization_slug
+end
+puts "Selected organization: #{selected_organization.name}"
+puts
 
+## select project
+projects = client.projects(selected_organization.id)
 project_slugs = projects.map(&:slug)
 puts 'Select project'
 selected_project_slug = `echo #{project_slugs.join ' '} | tr " " "\n" | fzf`.chomp
-
 if selected_project_slug.empty?
   puts 'No project selected.'
   exit 1
 end
-
 selected_project = projects.find do |project|
   project.slug == selected_project_slug
 end
-
 puts "Selected project: #{selected_project.name}"
 puts
 
+## input Bugsnag error id
 puts 'Input Bugsnag error id.'
 print '> '
 error_id = gets.chomp
@@ -34,89 +46,60 @@ end
 puts "Selected error id: #{error_id}"
 puts
 
-base_time = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-
+## get error events
+start_time = Time.now
 events = []
 begin
-  events.concat(client.error_events(selected_project.id, error_id, per_page: 100, base: base_time, full_reports: true))
+  # Bugsnag API document --- List the Events on an Error
+  # https://bugsnagapiv2.docs.apiary.io/#reference/errors/events/list-the-events-on-an-error
+  base_time = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+  error_events = client.error_events(
+    selected_project.id,
+    error_id,
+    base: base_time,
+    full_reports: true
+  )
+  events.concat(error_events)
 rescue Bugsnag::Api::NotFound
   puts 'Error id not found in Bugsnag.'
   exit 1
 end
 until client.last_response.rels[:next].nil?
-  base_time = client.last_response.data.last.received_at.strftime('%Y-%m-%dT%H:%M:%SZ')
-  events.concat(client.error_events(selected_project.id, error_id, per_page: 100, base: base_time, full_reports: true))
+  begin
+    base_time = client.last_response.data.last.received_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+    error_events = client.error_events(
+      selected_project.id,
+      error_id,
+      base: base_time,
+      full_reports: true
+    )
+    events.concat(error_events)
+    events.uniq!(&:id)
+    puts "Currently #{events.size} events in progress..."
+  rescue Bugsnag::Api::RateLimitExceeded => e
+    # Bugsnag API document --- Rate Limiting
+    # https://bugsnagapiv2.docs.apiary.io/#introduction/rate-limiting
+    retry_after = e.instance_variable_get(:@response).response_headers['retry-after'].to_i
+    puts "RateLimitExceeded Retry-After: #{retry_after} seconds"
+    sleep retry_after
+  end
 end
-events.uniq!(&:id)
+end_time = Time.now
+puts "Time elapsed: #{end_time - start_time} seconds"
+puts
 
-def event_title
-  [
-    'event.id',
-    'event.received_at',
-    'event.severity',
-    'exception.errorClass',
-    'exception.message',
-    'exception.type',
-    'event.request.url',
-    'event.request.clientIp',
-    'event.request.httpMethod',
-    'event.request.referer',
-    'X-Amzn-Trace-Id',
-    'headers.to_h',
-    'params.to_h',
-    'user_id',
-    'media',
-    'event.app.releaseStage',
-    'event.app.type',
-    'event.app.version',
-    'event.user.to_h',
-    'event.device.to_h',
-    'event.metaData.to_h',
-    'event.breadcrumbs.to_h',
-    'event.url'
-  ]
-end
-
-def event_row(event)
-  exception = event.exceptions.first
-  headers = event.request.headers
-  params = event.request.params
-  [
-    event.id,
-    event.received_at,
-    event.severity,
-    exception.errorClass,
-    exception.message,
-    exception.type,
-    # exception.stacktrace.to_h,
-    event.request.url,
-    event.request.clientIp,
-    event.request.httpMethod,
-    event.request.referer,
-    headers&.key?('X-Amzn-Trace-Id') ? headers['X-Amzn-Trace-Id'] : '',
-    headers&.to_h,
-    params&.to_h,
-    params&.key?('user_id') ? headers['user_id'] : '',
-    params&.key?('media') ? headers['media'] : '',
-    event.app.releaseStage,
-    event.app.type,
-    event.app.version,
-    event.user&.to_h,
-    event.device&.to_h,
-    event.metaData&.to_h,
-    event.breadcrumbs&.to_h,
-    event.url
-  ]
-end
-
-def generate_csv(events)
-  CSV.generate do |csv|
-    csv << event_title
-    events.each do |event|
-      csv << event_row(event)
+## generate CSV from events
+csv = CSV.generate do |rows|
+  headers = CSV_MAP.map { |m| m[:header] }
+  rows << headers
+  events.each do |event|
+    value_paths = CSV_MAP.map { |m| m[:value_path] }
+    row = value_paths.map do |value_path|
+      eval(value_path, binding, __FILE__, __LINE__) # rubocop:disable Security/Eval
     end
+    rows << row
   end
 end
 
-result = generate_csv(events)
-File.write('tmp/result.csv', result)
+File.write('tmp/result.csv', csv)
+puts 'Generated CSV file: tmp/result.csv'
