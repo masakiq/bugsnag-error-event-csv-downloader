@@ -1,7 +1,14 @@
+# frozen_string_literal: true
+
 require 'bugsnag/api'
 require 'csv'
-require 'pry'
-require './csv_map'
+require 'json'
+require 'jsonpath'
+begin
+  require 'pry'
+rescue LoadError
+  # do nothing
+end
 
 client = Bugsnag::Api::Client.new(auth_token: ENV['BUGSNAG_PERSONAL_AUTH_TOKEN'])
 
@@ -46,12 +53,102 @@ end
 puts "Selected error id: #{error_id}"
 puts
 
+## check exists tmp/csv_map.json
+csv_map = {}
+begin
+  csv_map_file = File.read('tmp/csv_map.json')
+  csv_map = JSON.parse(csv_map_file)
+rescue Errno::ENOENT
+  puts 'tmp/csv_map.json not found.'
+rescue JSON::ParserError
+  puts 'tmp/csv_map.json is not valid JSON.'
+end
+
+## generate tmp/csv_map.json
+if csv_map.empty?
+  puts 'Do you want to generate a CSV map file?'
+  print 'If yes, enter "y" > '
+  yes_or_no = gets.chomp
+  if yes_or_no != 'y'
+    puts 'Abort CSV map generation.'
+    exit
+  end
+
+  puts
+  puts 'Do you want to include "stacktrace" to a CSV map file?'
+  print 'If yes, enter "y" > '
+  need_stacktrace = gets.chomp == 'yes'
+
+  puts
+  puts 'Do you want to include "breadcrumbs" to a CSV map file?'
+  print 'If yes, enter "y" > '
+  need_breadcrumbs = gets.chomp == 'yes'
+
+  begin
+    # Bugsnag API document --- List the Events on an Error
+    # https://bugsnagapiv2.docs.apiary.io/#reference/errors/events/list-the-events-on-an-error
+    events = client.error_events(
+      selected_project.id,
+      error_id,
+      per_page: 30,
+      full_reports: true
+    )
+    all_paths = []
+    events.each do |event|
+      json = JSON.parse(event.to_h.to_json)
+      all_path = JsonPath.fetch_all_path(json)
+      all_paths.concat(all_path)
+    end
+    all_paths.uniq!
+
+    # size = all_paths.size
+    # all_paths.reject!.with_index do |all_path, i|
+    #   next_index = i + 1
+    #   next if next_index == size
+
+    #   next_all_path = all_paths[next_index]
+    #   next_all_path.start_with?(all_path)
+    # end
+
+    # all_paths.reject!.with_index do |all_path, i|
+    #   previouse_index = i - 1
+    #   next if previouse_index.negative?
+
+    #   previouse_all_path = all_paths[previouse_index]
+    #   previouse_all_path.start_with?(all_path)
+    # end
+
+    unless need_stacktrace
+      all_paths.reject! do |all_path|
+        all_path.include?('stacktrace')
+      end
+    end
+
+    unless need_breadcrumbs
+      all_paths.reject! do |all_path|
+        all_path.include?('breadcrumbs')
+      end
+    end
+
+    csv_map = all_paths[1..].map { |path| { header: path, path: path } }
+    csv_map_file = File.new('tmp/tmp_csv_map.json', 'w')
+    csv_map_file.puts(csv_map.to_json)
+    csv_map_file.close
+    system('cat tmp/tmp_csv_map.json | jq > tmp/csv_map.json')
+    system('rm tmp/tmp_csv_map.json')
+
+    puts 'Generated tmp/csv_map.json. Please edit it.'
+    exit
+  rescue Bugsnag::Api::NotFound
+    puts 'Error id not found in Bugsnag.'
+    exit 1
+  end
+end
+
 ## get error events
 start_time = Time.now
 events = []
 begin
-  # Bugsnag API document --- List the Events on an Error
-  # https://bugsnagapiv2.docs.apiary.io/#reference/errors/events/list-the-events-on-an-error
   base_time = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
   error_events = client.error_events(
     selected_project.id,
@@ -75,7 +172,7 @@ until client.last_response.rels[:next].nil?
     )
     events.concat(error_events)
     events.uniq!(&:id)
-    puts "Currently #{events.size} events in progress..."
+    puts "Currently #{events.size} events downloaded, in progress..."
   rescue Bugsnag::Api::RateLimitExceeded => e
     # Bugsnag API document --- Rate Limiting
     # https://bugsnagapiv2.docs.apiary.io/#introduction/rate-limiting
@@ -84,18 +181,19 @@ until client.last_response.rels[:next].nil?
     sleep retry_after
   end
 end
-end_time = Time.now
-puts "Time elapsed: #{end_time - start_time} seconds"
+puts "Downloaded #{events.size} events, in #{Time.now - start_time} seconds."
 puts
 
 ## generate CSV from events
 csv = CSV.generate do |rows|
-  headers = CSV_MAP.map { |m| m[:header] }
+  headers = csv_map.map { |m| m['header'] }
   rows << headers
   events.each do |event|
-    value_paths = CSV_MAP.map { |m| m[:value_path] }
-    row = value_paths.map do |value_path|
-      eval(value_path, binding, __FILE__, __LINE__) # rubocop:disable Security/Eval
+    paths = csv_map.map { |m| m['path'] }
+    row = paths.map do |path|
+      json_path = JsonPath.new(path)
+      json = event.to_h.to_json
+      json_path.on(json).join(',')
     end
     rows << row
   end
