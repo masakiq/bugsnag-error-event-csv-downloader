@@ -77,12 +77,12 @@ if csv_map.empty?
   puts
   puts 'Do you want to include "stacktrace" to a CSV map file?'
   print 'If yes, enter "y" > '
-  need_stacktrace = gets.chomp == 'yes'
+  need_stacktrace = gets.chomp == 'y'
 
   puts
   puts 'Do you want to include "breadcrumbs" to a CSV map file?'
   print 'If yes, enter "y" > '
-  need_breadcrumbs = gets.chomp == 'yes'
+  need_breadcrumbs = gets.chomp == 'y'
 
   begin
     # Bugsnag API document --- List the Events on an Error
@@ -193,7 +193,7 @@ csv = CSV.generate do |rows|
     row = paths.map do |path|
       json_path = JsonPath.new(path)
       json = event.to_h.to_json
-      json_path.on(json).join(',')
+      json_path.on(json).uniq.join(',')
     end
     rows << row
   end
